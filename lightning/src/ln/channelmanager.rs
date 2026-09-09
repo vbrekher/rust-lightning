@@ -10546,7 +10546,8 @@ impl<
 										if entry.get().is_empty() {
 											entry.remove();
 										}
-										debug_assert!(found_blocker);
+										// The forwarded blocker may already have been released by the
+										// original claim. In that case, leave unrelated blockers intact.
 									}
 								} else {
 									debug_assert!(false);

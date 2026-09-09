@@ -26,7 +26,7 @@ use crate::ln::msgs::{
 };
 use crate::ln::outbound_payment::{RecipientOnionFields, Retry};
 use crate::ln::types::ChannelId;
-use crate::routing::router::{PaymentParameters, RouteParameters};
+use crate::routing::router::{Path, PaymentParameters, Route, RouteHop, RouteParameters};
 use crate::sign::NodeSigner;
 use crate::util::native_async::FutureQueue;
 use crate::util::persist::{
@@ -5566,4 +5566,126 @@ fn test_monitor_update_after_funding_spend() {
 		},
 		_ => panic!("Unexpected event: {:?}", events[0]),
 	}
+}
+
+#[test]
+fn test_duplicate_onchain_forward_claim_with_other_downstream_blocker() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let legacy_cfg = test_legacy_channel_config();
+	let node_chanmgrs = create_node_chanmgrs(
+		3,
+		&node_cfgs,
+		&[Some(legacy_cfg.clone()), Some(legacy_cfg.clone()), Some(legacy_cfg)],
+	);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let chan_ab = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 50_000_000);
+	create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 100_000, 50_000_000);
+
+	// Route C -> B -> A, leaving B's downstream edge on the A-B channel.
+	let (forward_preimage, forward_hash, _, _) =
+		route_payment(&nodes[2], &[&nodes[1], &nodes[0]], 1_000_000);
+
+	// Keep an unrelated same-channel MPP claim pending on B. Its in-progress monitor
+	// updates leave A-B's blocker list occupied after the forwarded blocker is released.
+	let (mpp_preimage, mpp_hash, mpp_secret) =
+		get_payment_preimage_hash(&nodes[1], Some(1_000_000), None);
+	let mpp_parts = [333_333, 333_333, 333_334];
+	let mpp_paths = mpp_parts
+		.iter()
+		.map(|amt| Path {
+			hops: vec![RouteHop {
+				pubkey: node_b_id,
+				node_features: nodes[1].node.node_features(),
+				short_channel_id: chan_ab.0.contents.short_channel_id,
+				channel_features: nodes[1].node.channel_features(),
+				fee_msat: *amt,
+				cltv_expiry_delta: TEST_FINAL_CLTV,
+				maybe_announced_channel: true,
+			}],
+			blinded_tail: None,
+		})
+		.collect();
+	let payment_params = PaymentParameters::from_node_id(node_b_id, TEST_FINAL_CLTV)
+		.with_bolt11_features(nodes[1].node.bolt11_invoice_features())
+		.unwrap();
+	let route_params = RouteParameters::from_payment_params_and_value(payment_params, 1_000_000);
+	let route = Route { paths: mpp_paths, route_params };
+	let onion = RecipientOnionFields::secret_only(mpp_secret, 1_000_000);
+	nodes[0].node.send_payment_with_route(route, mpp_hash, onion, PaymentId(mpp_hash.0)).unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	let mut mpp_msg_events = nodes[0].node.get_and_clear_pending_msg_events();
+	let mut mpp_parts_received = 0;
+	while mpp_parts_received < mpp_parts.len() {
+		assert_eq!(mpp_msg_events.len(), 1);
+		let mpp_event = SendEvent::from_event(mpp_msg_events.pop().unwrap());
+		mpp_parts_received += mpp_event.msgs.len();
+		for update_add in mpp_event.msgs.iter() {
+			nodes[1].node.handle_update_add_htlc(node_a_id, update_add);
+			check_added_monitors(&nodes[1], 0);
+		}
+		nodes[1].node.handle_commitment_signed_batch_test(node_a_id, &mpp_event.commitment_msg);
+		check_added_monitors(&nodes[1], 1);
+		let (extra_msg, bs_raa, next_mpp_msg_events) =
+			do_main_commitment_signed_dance(&nodes[1], &nodes[0], false);
+		assert!(extra_msg.is_none());
+		nodes[1].node.handle_revoke_and_ack(node_a_id, &bs_raa);
+		check_added_monitors(&nodes[1], 1);
+		nodes[1].node.process_pending_htlc_forwards();
+		let events = nodes[1].node.get_and_clear_pending_events();
+		if mpp_parts_received == mpp_parts.len() {
+			assert_eq!(events.len(), 1);
+			match &events[0] {
+				Event::PaymentClaimable { payment_hash, amount_msat, .. } => {
+					assert_eq!(*payment_hash, mpp_hash);
+					assert_eq!(*amount_msat, 1_000_000);
+				},
+				_ => panic!("Unexpected event"),
+			}
+		} else {
+			assert!(events.is_empty(), "{:?}", events);
+		}
+		mpp_msg_events = next_mpp_msg_events;
+	}
+	assert!(mpp_msg_events.is_empty());
+
+	// Hold all three MPP monitor updates so the ClaimedMPPPayment blocker remains.
+	for _ in 0..mpp_parts.len() {
+		chanmon_cfgs[1].persister.set_update_ret(ChannelMonitorUpdateStatus::InProgress);
+	}
+	nodes[1].node.claim_funds(mpp_preimage);
+	check_added_monitors(&nodes[1], 3);
+
+	// A's off-chain fulfill makes B claim from C. The upstream update completes and
+	// releases B's ForwardedPaymentInboundClaim blocker on A-B once.
+	nodes[0].node.claim_funds(forward_preimage);
+	expect_payment_claimed!(nodes[0], forward_hash, 1_000_000);
+	check_added_monitors(&nodes[0], 1);
+	let as_updates = get_htlc_update_msgs(&nodes[0], &node_b_id);
+	nodes[1].node.handle_update_fulfill_htlc(node_a_id, as_updates.update_fulfill_htlcs[0].clone());
+	check_added_monitors(&nodes[1], 1);
+
+	// An on-chain replay sees the same preimage. The duplicate cleanup must tolerate the
+	// forwarded blocker already being gone while the unrelated MPP blocker remains.
+	let as_txn = get_local_commitment_txn!(nodes[0], chan_ab.2);
+	assert!(as_txn.len() >= 2, "Expected commitment + HTLC-success tx, got {}", as_txn.len());
+	mine_transaction(&nodes[1], &as_txn[0]);
+
+	let htlc_success_tx = as_txn
+		.iter()
+		.skip(1)
+		.find(|tx| {
+			tx.input.iter().any(|input| {
+				input.witness.iter().any(|witness_item| witness_item == forward_preimage.0)
+			})
+		})
+		.expect("expected an HTLC-success tx for the forwarded payment");
+	mine_transaction(&nodes[1], htlc_success_tx);
+	connect_blocks(&nodes[1], ANTI_REORG_DELAY);
+	nodes[1].node.get_and_clear_pending_events();
 }
